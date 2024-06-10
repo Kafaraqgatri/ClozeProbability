@@ -1,0 +1,82 @@
+import pandas as pd
+from openai import OpenAI
+from pandasql import sqldf
+from tqdm import tqdm
+
+API_KEY = 'YOUR API KEY'
+client = OpenAI(
+    api_key=API_KEY
+)
+
+
+# Function to get log probability of the last word in a sentence
+def getLogProb(sentence):
+    word = sentence.split(' ')[-1].strip('.')
+    chat_completion = client.chat.completions.create(
+        messages=[
+            {"role": "system", "content": "You need to echo the input of the user. Do not generate any new content."},
+            {"role": "user", "content": sentence}
+        ],
+        model="gpt-3.5-turbo",
+        temperature=0,
+        logprobs=True,
+    )
+    tokens_data = [
+        {
+            "token": logprob.token,
+            "logprob": logprob.logprob,
+            "bytes": logprob.bytes
+        }
+        for logprob in chat_completion.choices[0].logprobs.content
+    ]
+    df_tokens = pd.DataFrame(tokens_data)
+    df_tokens.token = [x.strip() for x in df_tokens.token]
+    return df_tokens.loc[df_tokens.token == word, 'logprob'].iloc[0]
+
+
+# Load and prepare data
+qualtrics = pd.read_csv('FilteredQualtricsList.csv')
+qualtrics['word'] = [x.split(' ')[-1].strip('.') for x in qualtrics.Target]
+qualtrics['word_cond'] = qualtrics.word + '_' + qualtrics.Cond
+
+expwords = pd.read_csv('expanded_word_conditions.csv')
+expwords['word_cond'] = expwords.Word + '_' + expwords.Conditions
+
+# Join data and add unique ID
+df = sqldf('''SELECT 
+               expwords.word_cond as id, 
+               expwords.Conditions as cond,
+               qualtrics.Target as sentence,
+               expwords.Word as word
+      FROM expwords 
+      INNER JOIN qualtrics 
+      ON expwords.word_cond = qualtrics.word_cond''')
+
+# Deduplicate sentences based on content
+df_unique_sentences = df.drop_duplicates(subset=['sentence'], keep='first')
+df_unique_sentences.reset_index(drop=True, inplace=True)
+
+# Calculate log probabilities for unique sentences
+logprobs = {}
+for row in tqdm(df_unique_sentences.index):
+    id = df_unique_sentences.loc[row]['id']
+    sentence = df_unique_sentences.loc[row]['sentence']
+    word = df_unique_sentences.loc[row]['word']
+    try:
+        logprob = getLogProb(sentence)
+    except IndexError:
+        logprob = "Target word is multiple tokens"
+    logprobs[id] = logprob
+
+# Save log probabilities to CSV
+logprob_df = df_unique_sentences.set_index('id')
+for id in logprob_df.index:
+    logprob_df.loc[id, 'logprob'] = logprobs[id]
+logprob_df.to_csv('GPT_logprobs.csv')
+
+# Optional: Display sentences with issues
+nonNumeric = len([x for x in logprob_df.logprob if type(x) == str])
+print(f"There are {nonNumeric} sentences whose target words are multiple tokens:\n")
+for row in logprob_df.index:
+    if type(logprob_df.loc[row, 'logprob']) == str:
+        print(row + ': ' + logprob_df.loc[row, 'sentence'])
