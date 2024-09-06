@@ -1,82 +1,79 @@
+import openai
 import pandas as pd
-from openai import OpenAI
-from pandasql import sqldf
-from tqdm import tqdm
+import os
+from dotenv import load_dotenv
 
-API_KEY = 'YOUR API KEY'
-client = OpenAI(
-    api_key=API_KEY
+# Load environment variables from .env file 
+load_dotenv(r"C:\Users\Cagi\API.env")
+
+# Initialize OpenAI client
+client = openai.OpenAI(
+    api_key=os.environ.get("OPENAI_API_KEY"),
 )
 
+# Load the Excel file
+file_path = r"C:\Users\Cagi\Desktop\LogProb_Sheridan.xlsx"
+df = pd.read_excel(file_path)
 
-# Function to get log probability of the last word in a sentence
-def getLogProb(sentence):
-    word = sentence.split(' ')[-1].strip('.')
-    chat_completion = client.chat.completions.create(
-        messages=[
-            {"role": "system", "content": "You need to echo the input of the user. Do not generate any new content."},
-            {"role": "user", "content": sentence}
-        ],
-        model="gpt-3.5-turbo",
-        temperature=0,
-        logprobs=True,
-    )
-    tokens_data = [
-        {
-            "token": logprob.token,
-            "logprob": logprob.logprob,
-            "bytes": logprob.bytes
-        }
-        for logprob in chat_completion.choices[0].logprobs.content
-    ]
-    df_tokens = pd.DataFrame(tokens_data)
-    df_tokens.token = [x.strip() for x in df_tokens.token]
-    return df_tokens.loc[df_tokens.token == word, 'logprob'].iloc[0]
+# Number of runs to average
+num_runs = 10
 
+# Prepare a list to store results
+results = []
 
-# Load and prepare data
-qualtrics = pd.read_csv('FilteredQualtricsList.csv')
-qualtrics['word'] = [x.split(' ')[-1].strip('.') for x in qualtrics.Target]
-qualtrics['word_cond'] = qualtrics.word + '_' + qualtrics.Cond
+# Iterate over each row in the DataFrame
+for index, row in df.iterrows():
+    sentence = row['Full Sentence']
+    target_word = row['Target']
 
-expwords = pd.read_csv('expanded_word_conditions.csv')
-expwords['word_cond'] = expwords.Word + '_' + expwords.Conditions
+    # List to store log probabilities for each run
+    logprobs_list = []
 
-# Join data and add unique ID
-df = sqldf('''SELECT 
-               expwords.word_cond as id, 
-               expwords.Conditions as cond,
-               qualtrics.Target as sentence,
-               expwords.Word as word
-      FROM expwords 
-      INNER JOIN qualtrics 
-      ON expwords.word_cond = qualtrics.word_cond''')
+    for _ in range(num_runs):
+        # Get log probabilities for the sentence
+        chat_completion = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "You need to echo the input of the user. Do not generate any new content."},
+                {"role": "user", "content": sentence},
+            ],
+            model="gpt-3.5-turbo-0125",
+            temperature=0,
+            logprobs=True,
+        )
 
-# Deduplicate sentences based on content
-df_unique_sentences = df.drop_duplicates(subset=['sentence'], keep='first')
-df_unique_sentences.reset_index(drop=True, inplace=True)
+        # Extract log probabilities for each token
+        tokens_data = [
+            {
+                "token": logprob.token.strip(),  # Strip leading/trailing spaces
+                "logprob": logprob.logprob,
+                "bytes": logprob.bytes,
+            }
+            for logprob in chat_completion.choices[0].logprobs.content
+        ]
 
-# Calculate log probabilities for unique sentences
-logprobs = {}
-for row in tqdm(df_unique_sentences.index):
-    id = df_unique_sentences.loc[row]['id']
-    sentence = df_unique_sentences.loc[row]['sentence']
-    word = df_unique_sentences.loc[row]['word']
-    try:
-        logprob = getLogProb(sentence)
-    except IndexError:
-        logprob = "Target word is multiple tokens"
-    logprobs[id] = logprob
+        # Find the log probability of the target word
+        for token_data in tokens_data:
+            if token_data["token"] == target_word:
+                logprobs_list.append(token_data["logprob"])
+                break
 
-# Save log probabilities to CSV
-logprob_df = df_unique_sentences.set_index('id')
-for id in logprob_df.index:
-    logprob_df.loc[id, 'logprob'] = logprobs[id]
-logprob_df.to_csv('GPT_logprobs.csv')
+    # Calculate the average log probability for the target word
+    if logprobs_list:
+        avg_logprob = sum(logprobs_list) / len(logprobs_list)
+    else:
+        avg_logprob = None
 
-# Optional: Display sentences with issues
-nonNumeric = len([x for x in logprob_df.logprob if type(x) == str])
-print(f"There are {nonNumeric} sentences whose target words are multiple tokens:\n")
-for row in logprob_df.index:
-    if type(logprob_df.loc[row, 'logprob']) == str:
-        print(row + ': ' + logprob_df.loc[row, 'sentence'])
+    results.append({
+        "Sentence": sentence,
+        "Target Word": target_word,
+        "Average Log Probability": avg_logprob
+    })
+
+# Convert results to a DataFrame
+df_results = pd.DataFrame(results)
+
+# Save the results to a new Excel file
+output_file_path = r"C:\Users\Cagi\Desktop\LogProb_Sheridan_Results.xlsx"
+df_results.to_excel(output_file_path, index=False)
+
+print(f"Results saved to {output_file_path}")
